@@ -637,7 +637,7 @@ def scan():
         if opened>=limit:break
         if s in used or s in mine:continue
         try:
-            enter(s,setup["side"])
+            enter(s,"SHORT" if setup["side"]=="LONG" else "LONG")
             # enter() writes mine only after a successful protected entry.
             if s in mine:
                 opened+=1; entries_this_candle+=1; used.add(s); save()
