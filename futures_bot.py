@@ -19,8 +19,8 @@ S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0; basket_rearm_dir=""; basket_rearm_touched=False
 STATE="state.json"
-REPORT_STATE="hundred_trade_report.json"
-REPORT_EVERY_TRADES=100
+REPORT_STATE="fifty_trade_report.json"
+REPORT_EVERY_TRADES=50
 
 def pub(path,p=None):
     r=S.get(BASE+path,params=p or {},timeout=15); r.raise_for_status(); return r.json()
@@ -334,7 +334,7 @@ def _report_save(d):
     try:
         with open(REPORT_STATE,"w") as f: json.dump(d,f)
     except Exception as e:
-        logging.warning("100-trade report save failed: %s",e)
+        logging.warning("50-trade report save failed: %s",e)
 
 def record_closed_trade(s, st):
     """Diagnostics only. Does not affect signals, entries, exits, SL or TP."""
@@ -370,46 +370,28 @@ def record_closed_trade(s, st):
     except Exception as e:
         logging.warning("%s exit diagnostic failed: %s",s,e)
 
-def maybe_hundred_trade_report():
-    """Telegram/log detailed report every 100 closed trades; reporting only."""
+def maybe_fifty_trade_report():
+    """Telegram/log report every 50 closed trades; reporting only."""
     d=_report_load()
     rows=d.get("closed",[])
     if len(rows)<REPORT_EVERY_TRADES:return
     batch=rows[:REPORT_EVERY_TRADES]
     wins=[x for x in batch if x.get("net",0)>0]
     losses=[x for x in batch if x.get("net",0)<0]
-    breakeven=[x for x in batch if x.get("net",0)==0]
-    longs=[x for x in batch if x.get("side")=="LONG"]
-    shorts=[x for x in batch if x.get("side")=="SHORT"]
-    long_wins=[x for x in longs if x.get("net",0)>0]
-    short_wins=[x for x in shorts if x.get("net",0)>0]
     net=sum(x.get("net",0) for x in batch)
-    gross=sum(x.get("realized",0) for x in batch)
     fees=sum(x.get("commission",0) for x in batch)
-    gross_profit=sum(x.get("net",0) for x in wins)
-    gross_loss=abs(sum(x.get("net",0) for x in losses))
-    avg_win=(gross_profit/len(wins)) if wins else 0.0
-    avg_loss=(gross_loss/len(losses)) if losses else 0.0
-    profit_factor=(gross_profit/gross_loss) if gross_loss>0 else 0.0
-    avg_duration=(sum(x.get("duration_sec",0) for x in batch)/len(batch)) if batch else 0.0
     from collections import Counter
     reasons=Counter(x.get("reason","UNKNOWN") for x in losses)
-    symbols=Counter(x.get("symbol","UNKNOWN") for x in losses)
+    sides=Counter(x.get("side","UNKNOWN") for x in losses)
     reason_text=", ".join(f"{k}: {v}" for k,v in reasons.most_common()) or "None"
-    worst_symbols=", ".join(f"{k}: {v}" for k,v in symbols.most_common(10)) or "None"
-    report=(f"100-TRADE BOT DETAILED DIAGNOSTIC REPORT\n"
-            f"Closed: {len(batch)} | Wins: {len(wins)} | Losses: {len(losses)} | BE: {len(breakeven)}\n"
+    side_text=", ".join(f"{k}: {v}" for k,v in sides.most_common()) or "None"
+    report=(f"50-TRADE BOT DIAGNOSTIC REPORT\n"
+            f"Closed trades: {len(batch)} | Wins: {len(wins)} | Losses: {len(losses)}\n"
             f"Win rate: {(100*len(wins)/len(batch) if batch else 0):.1f}%\n"
-            f"Net PnL: ${net:.2f} | Gross realized: ${gross:.2f} | Fees: ${fees:.2f}\n"
-            f"Gross wins: ${gross_profit:.2f} | Gross losses: -${gross_loss:.2f}\n"
-            f"Avg win: ${avg_win:.3f} | Avg loss: -${avg_loss:.3f} | Profit factor: {profit_factor:.2f}\n"
-            f"LONG: {len(longs)} | Wins: {len(long_wins)} | WR: {(100*len(long_wins)/len(longs) if longs else 0):.1f}% | Net: ${sum(x.get('net',0) for x in longs):.2f}\n"
-            f"SHORT: {len(shorts)} | Wins: {len(short_wins)} | WR: {(100*len(short_wins)/len(shorts) if shorts else 0):.1f}% | Net: ${sum(x.get('net',0) for x in shorts):.2f}\n"
-            f"Avg duration: {avg_duration/60:.1f} min\n"
+            f"Net PnL: ${net:.2f} | Fees: ${fees:.2f}\n"
             f"Loss/exit causes: {reason_text}\n"
-            f"Most repeated losing symbols: {worst_symbols}\n"
-            f"DEMO FILTER ACTIVE: LONG blocked when RSI > 70\n"
-            f"NOTE: diagnostic report only; no automatic strategy changes.")
+            f"Losing sides: {side_text}\n"
+            f"NOTE: diagnostic report only; strategy and trade management unchanged.")
     msg(report,bal=False)
     _report_save({"closed":rows[REPORT_EVERY_TRADES:]})
 
@@ -424,7 +406,7 @@ def manage():
             record_closed_trade(s,st)
             mine.pop(s,None); save()
             msg(f"{s} CLOSED ON EXCHANGE | Actual PnL reconciled")
-            maybe_hundred_trade_report()
+            maybe_fifty_trade_report()
     for s in list(mine):
         p=ps.get(s)
         if not p: continue
@@ -575,9 +557,6 @@ def long_engine(s,btc):
     tp=(h+l+c)/3; vwap=float(np.sum(tp[-20:]*v[-20:])/max(np.sum(v[-20:]),1e-12))
     r=rsi_last(c); vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
     buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
-    # DEMO TEST FILTER: avoid late/overbought LONG entries.
-    if r > 70:
-        return None
     prior_high=float(np.max(h[-12:-2]))
     choch=c[-1]>prior_high or (c[-1]>e21 and c[-2]<=e21)
     retest=l[-1]<=max(e21,vwap)*1.003 and c[-1]>max(e21,vwap)
