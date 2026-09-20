@@ -609,6 +609,9 @@ def short_engine(s,btc):
     e21=float(pd.Series(c).ewm(span=21,adjust=False).mean().iloc[-1])
     r=rsi_last(c); vr=float(v[-1]/max(np.mean(v[-20:]),1e-12))
     buy=float(np.sum(tb[-3:])/max(np.sum(v[-3:]),1e-12))
+    # DEMO TEST FILTER: block SHORT entries when RSI is above 52.5.
+    if r > 52.5:
+        return None
     breakdown=c[-1]<e21 or c[-1]<l[-2]
     rejection=h[-1]>h[-2] and c[-1]<o[-1]
     score=62.0
