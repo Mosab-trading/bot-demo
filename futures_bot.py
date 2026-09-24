@@ -15,6 +15,11 @@ EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
 BASKET=50.0; LOSS_LIMIT=100.0
 ALLOCATED_CAPITAL=float(os.getenv("ALLOCATED_CAPITAL","500"))
 TAKER_FEE_RATE=float(os.getenv("TAKER_FEE_RATE","0.0005"))
+# Optional Flow Radar bridge. Expected JSON per symbol:
+# {"BTCUSDT":{"score":24,"confirm30":"BUY","confirm60":"NEUTRAL","priceConfirm":false}, ...}
+# If no URL/data is available, the filter stays NEUTRAL and the original strategy is preserved.
+FLOW_RADAR_URL=os.getenv("FLOW_RADAR_URL","").strip()
+FLOW_RADAR_TIMEOUT=float(os.getenv("FLOW_RADAR_TIMEOUT","3"))
 S=requests.Session(); S.headers.update({"X-MBX-APIKEY":KEY})
 logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
 meta={}; mine={}; btc_mode="WAIT"; pause_until=0; loss_window=0; losing_cycles=0; cycle_realized=0; bot_realized=0; basket_lock_candle=0; entry_candle=0; entries_this_candle=0; basket_rearm_dir=""; basket_rearm_touched=False
@@ -625,6 +630,55 @@ def short_engine(s,btc):
     return {"side":"SHORT","score":round(score,2),"tag":"SHORT_LIQUIDITY_REVERSAL+QUALITY",
             "details":f"rsi={r:.1f} vol={vr:.2f} buy={buy:.2f}"}
 
+# --- Flow Radar decision layer (FILTER ONLY; never opens a trade by itself) ---
+def flow_radar_snapshot():
+    if not FLOW_RADAR_URL:
+        return {}
+    try:
+        r=requests.get(FLOW_RADAR_URL,timeout=FLOW_RADAR_TIMEOUT)
+        r.raise_for_status()
+        d=r.json()
+        return d.get("symbols",d) if isinstance(d,dict) else {}
+    except Exception as e:
+        logging.warning("FLOW RADAR unavailable: %s",e)
+        return {}
+
+def _flow_side(v):
+    return str(v or "NEUTRAL").upper().replace("STRONG ","").replace(" ABSORPTION","")
+
+def flow_filter(symbol, side, radar):
+    """Return (allowed, rank_bonus, label).
+
+    Rules agreed for the bot:
+      >= +65 STRONG LONG only when 30s BUY + 60s BUY + priceConfirm.
+      +25..+64 LONG BIAS: reinforces LONG only; never creates an entry.
+      -24..+24 NEUTRAL: original strategy unchanged.
+      -25..-64 SHORT BIAS: reinforces SHORT only; never creates an entry.
+      <= -65 STRONG SHORT only when 30s SELL + 60s SELL + priceConfirm.
+    Missing radar data is fail-open NEUTRAL so a radar outage cannot silently stop the bot.
+    """
+    x=radar.get(symbol) if isinstance(radar,dict) else None
+    if not isinstance(x,dict):
+        return True,0.0,"FLOW NEUTRAL/NO DATA"
+    try: score=float(x.get("score",0))
+    except: score=0.0
+    c30=_flow_side(x.get("confirm30",x.get("30s")))
+    c60=_flow_side(x.get("confirm60",x.get("60s")))
+    pc=bool(x.get("priceConfirm",x.get("price_confirm",False)))
+    if score>=65:
+        ok=(side=="LONG" and c30=="BUY" and c60=="BUY" and pc)
+        return ok,(15.0 if ok else 0.0),f"FLOW STRONG LONG {score:+.0f} 30={c30} 60={c60} price={pc}"
+    if score>=25:
+        ok=(side=="LONG")
+        return ok,(7.0 if ok else 0.0),f"FLOW LONG BIAS {score:+.0f}"
+    if score<=-65:
+        ok=(side=="SHORT" and c30=="SELL" and c60=="SELL" and pc)
+        return ok,(15.0 if ok else 0.0),f"FLOW STRONG SHORT {score:+.0f} 30={c30} 60={c60} price={pc}"
+    if score<=-25:
+        ok=(side=="SHORT")
+        return ok,(7.0 if ok else 0.0),f"FLOW SHORT BIAS {score:+.0f}"
+    return True,0.0,f"FLOW NEUTRAL {score:+.0f}"
+
 def scan():
     global btc_mode,entry_candle,entries_this_candle,basket_rearm_dir,basket_rearm_touched,basket_lock_candle
     if time.time()<pause_until:return
@@ -647,17 +701,26 @@ def scan():
     limit=min(max(0,2-entries_this_candle),max(0,MAX_POS-risk_position_count()))
     if limit<=0:return
     candidates=[]
+    radar=flow_radar_snapshot()
     for s in universe():
         if s in mine:continue
         try:
-            # V2.1: market direction controls NEW slots only. Existing positions are never
-            # force-closed on a BTC context flip; they keep their own SL/TP management.
-            if ctx["bias"] in ("SHORT","NEUTRAL"):
-                sh=short_engine(s,ctx)
-                if sh:candidates.append((float(sh["score"]),s,sh))
-            if ctx["bias"] in ("LONG","NEUTRAL"):
-                lo=long_engine(s,ctx)
-                if lo:candidates.append((float(lo["score"]),s,lo))
+            # BTC is CONTEXT ONLY: evaluate both engines. Flow Radar can filter/rank a
+            # strategy-generated setup, but it can never create a trade by itself.
+            sh=short_engine(s,ctx)
+            if sh:
+                ok,bonus,label=flow_filter(s,"SHORT",radar)
+                if ok:
+                    sh["flow_label"]=label
+                    candidates.append((float(sh["score"])+bonus,s,sh))
+                else: logging.info("FLOW BLOCK SHORT %s | %s",s,label)
+            lo=long_engine(s,ctx)
+            if lo:
+                ok,bonus,label=flow_filter(s,"LONG",radar)
+                if ok:
+                    lo["flow_label"]=label
+                    candidates.append((float(lo["score"])+bonus,s,lo))
+                else: logging.info("FLOW BLOCK LONG %s | %s",s,label)
         except Exception as e:logging.warning("%s scoring failed: %s",s,e)
     candidates.sort(key=lambda x:x[0],reverse=True)
     opened=0; used=set()
@@ -669,7 +732,7 @@ def scan():
             # enter() writes mine only after a successful protected entry.
             if s in mine:
                 opened+=1; entries_this_candle+=1; used.add(s); save()
-                logging.info("SELECTED %s %s | score %.2f | %s",setup["side"],s,score,setup["details"])
+                logging.info("SELECTED %s %s | score %.2f | %s | %s",setup["side"],s,score,setup["details"],setup.get("flow_label","FLOW NEUTRAL"))
         except Exception as e:logging.warning("%s entry failed: %s",s,e)
     logging.info("BTC CANDLE %s | CONTEXT %s | OPENED %s | CANDLE TOTAL %s/2 | OPEN %s | RISK SLOTS %s/%s",
                  closed_candle,ctx["bias"],opened,entries_this_candle,open_position_count(),risk_position_count(),MAX_POS)
