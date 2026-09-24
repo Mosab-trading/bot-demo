@@ -8,7 +8,7 @@ import numpy as np
 KEY=os.getenv("BINANCE_API_KEY",""); SECRET=os.getenv("BINANCE_API_SECRET","")
 BASE=os.getenv("EXCHANGE_BASE_URL","https://demo-fapi.binance.com").rstrip("/")
 TG=os.getenv("TELEGRAM_BOT_TOKEN",""); CHAT=os.getenv("TELEGRAM_CHAT_ID","")
-BOT_VERSION="V2.1.2-BREAKEVEN-SLOTS-MAXQTY-FIX-LIVE-NO-BASKET-50REPORT"
+BOT_VERSION="V2.2-FLOW-FILTER-BTC-CONTEXT-ONLY"
 TF="15m"; NOTIONAL=100.0; TARGET_LEV=20; MAX_POS=25
 MIN_VOL=float(os.getenv("MIN_QUOTE_VOLUME","5000000"))
 EXCLUDED={"BNBUSDT","DOGEUSDT","BCHUSDT"}
@@ -691,9 +691,7 @@ def scan():
                  ctx["bias"],ctx["score"],ctx.get("buy_ratio",.5),ctx.get("vol_ratio",1))
     # Telegram only when the BTC market state changes; never spam every scan.
     if btc_mode != old_mode:
-        direction_text = ("New positions: LONG only" if btc_mode=="LONG" else
-                          "New positions: SHORT only" if btc_mode=="SHORT" else
-                          "New positions: LONG or SHORT by setup score")
+        direction_text = "BTC is context only | BOTH LONG and SHORT remain eligible by strategy + Flow Filter"
         msg(f"BTC MARKET CHANGE: {old_mode} -> {btc_mode}\n{direction_text}\nExisting positions continue with Profit Lock / SL / TP", bal=False)
         save()
     if closed_candle!=entry_candle:
@@ -702,6 +700,10 @@ def scan():
     if limit<=0:return
     candidates=[]
     radar=flow_radar_snapshot()
+    if FLOW_RADAR_URL:
+        logging.info("FLOW FILTER: %s | symbols=%d | thresholds +65/+25/-25/-65", "CONNECTED" if radar else "NO DATA", len(radar))
+    else:
+        logging.info("FLOW FILTER: INACTIVE (FLOW_RADAR_URL not set) | fail-open NEUTRAL | original strategy continues")
     for s in universe():
         if s in mine:continue
         try:
@@ -744,7 +746,8 @@ def main():
     ps=positions()
     for s in list(mine):
         if s not in ps:mine.pop(s,None)
-    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Notional: $100 | Max: 25 | BTC context controls NEW slots only; BE+ positions free a risk slot | existing trades are not force-closed | Profit Lock: +30/-25, +50/BE, +75/+25, TP1 +100/50%+SL50, TP2 +150/25%+SL100, TP3 +200 final\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
+    flow_status="configured" if FLOW_RADAR_URL else "inactive/no URL"
+    msg(f"Dual Engine {BOT_VERSION} STARTED\nAllocated: ${ALLOCATED_CAPITAL:.0f} | Max: {MAX_POS} | BTC = CONTEXT ONLY (never blocks LONG/SHORT) | Flow Filter: {flow_status} | thresholds +65/+25/-25/-65 | Existing positions continue normally\nExcluded: BNB, DOGE, BCH | Liquidity floor: ${MIN_VOL:,.0f}/24h")
     last=0
     while True:
         try:
@@ -754,4 +757,3 @@ def main():
         except Exception as e:
             logging.exception(e);time.sleep(5)
 if __name__=="__main__":main()
-
